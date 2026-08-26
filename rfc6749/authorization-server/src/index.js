@@ -1,0 +1,180 @@
+const express = require('express');
+const { redis, connectRedis } = require('./redis');
+const { genToken, hashPassword } = require('./tokens');
+const { seed } = require('./seed');
+const { loginPage, errorPage } = require('./views');
+const { captureInbound } = require('./events');
+
+const PORT = process.env.PORT || 3001;
+const ACCESS_TOKEN_TTL = 300; // 5 min — curto de proposito, p/ demonstrar refresh
+const REFRESH_TOKEN_TTL = 3600; // 1h
+const AUTH_CODE_TTL = 60; // 1 min, uso unico
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+// observabilidade: /authorize vem do browser, /token vem do backend do client-demo
+app.use(captureInbound('as', (req) => (req.path === '/token' ? 'client-demo (backend)' : 'browser')));
+
+async function getClient(clientId) {
+  if (!clientId) return null;
+  const data = await redis.hGetAll(`client:${clientId}`);
+  return Object.keys(data).length ? data : null;
+}
+
+function parseClientAuth(req) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Basic ')) {
+    const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+    const idx = decoded.indexOf(':');
+    if (idx === -1) return null;
+    return { clientId: decoded.slice(0, idx), clientSecret: decoded.slice(idx + 1), viaHeader: true };
+  }
+  if (req.body.client_id) {
+    return { clientId: req.body.client_id, clientSecret: req.body.client_secret, viaHeader: false };
+  }
+  return null;
+}
+
+function tokenError(res, status, error, description, usedBasicAuth) {
+  if (status === 401 && usedBasicAuth) {
+    res.set('WWW-Authenticate', 'Basic realm="oauth-rfc6749-as"');
+  }
+  res.set('Cache-Control', 'no-store');
+  res.set('Pragma', 'no-cache');
+  return res.status(status).json({ error, error_description: description });
+}
+
+// --- Authorization endpoint (RFC 6749 §3.1) ---
+
+app.get('/authorize', async (req, res) => {
+  const { response_type, client_id, redirect_uri, scope = '', state } = req.query;
+  const client = await getClient(client_id);
+
+  if (!client || !redirect_uri || client.redirect_uri !== redirect_uri) {
+    return res.status(400).send(errorPage('client_id ou redirect_uri invalidos/nao registrados — nao e seguro redirecionar o usuario.'));
+  }
+  if (response_type !== 'code') {
+    return res.redirect(`${redirect_uri}?error=unsupported_response_type${state ? `&state=${encodeURIComponent(state)}` : ''}`);
+  }
+
+  res.send(loginPage({ clientName: client.name, scope, clientId: client_id, redirectUri: redirect_uri, state }));
+});
+
+app.post('/authorize', async (req, res) => {
+  const { client_id, redirect_uri, scope = '', state, username, password, decision } = req.body;
+  const client = await getClient(client_id);
+
+  if (!client || client.redirect_uri !== redirect_uri) {
+    return res.status(400).send(errorPage('client_id ou redirect_uri invalidos.'));
+  }
+
+  const withState = (qs) => `${redirect_uri}?${qs}${state ? `&state=${encodeURIComponent(state)}` : ''}`;
+
+  if (decision === 'deny') {
+    return res.redirect(withState('error=access_denied'));
+  }
+
+  const user = await redis.hGetAll(`user:${username}`);
+  if (!Object.keys(user).length || user.password_hash !== hashPassword(password || '')) {
+    return res.status(401).send(loginPage({
+      clientName: client.name,
+      scope,
+      clientId: client_id,
+      redirectUri: redirect_uri,
+      state,
+      error: 'Usuário ou senha inválidos.',
+    }));
+  }
+
+  const code = genToken();
+  await redis.hSet(`authcode:${code}`, { client_id, redirect_uri, scope, username });
+  await redis.expire(`authcode:${code}`, AUTH_CODE_TTL);
+
+  return res.redirect(withState(`code=${code}`));
+});
+
+// --- Token endpoint (RFC 6749 §3.2 / §5) ---
+
+app.post('/token', async (req, res) => {
+  const auth = parseClientAuth(req);
+  const grantType = req.body.grant_type;
+
+  if (!auth || !auth.clientId) {
+    return tokenError(res, 400, 'invalid_request', 'client_id/client_secret ausentes');
+  }
+  const client = await getClient(auth.clientId);
+  if (!client || client.client_secret !== auth.clientSecret) {
+    return tokenError(res, 401, 'invalid_client', 'client_id ou client_secret invalidos', auth.viaHeader);
+  }
+  const allowedGrants = client.grant_types.split(',');
+  if (!allowedGrants.includes(grantType)) {
+    return tokenError(res, 400, 'unauthorized_client', `client nao autorizado para grant_type=${grantType}`);
+  }
+
+  if (grantType === 'authorization_code') {
+    const { code, redirect_uri } = req.body;
+    const authCode = await redis.hGetAll(`authcode:${code}`);
+    if (!Object.keys(authCode).length || authCode.client_id !== auth.clientId || authCode.redirect_uri !== redirect_uri) {
+      return tokenError(res, 400, 'invalid_grant', 'authorization code invalido, expirado ou ja utilizado');
+    }
+    await redis.del(`authcode:${code}`); // uso unico
+    return issueTokens(res, { clientId: auth.clientId, username: authCode.username, scope: authCode.scope, withRefresh: true });
+  }
+
+  if (grantType === 'refresh_token') {
+    const { refresh_token } = req.body;
+    const stored = await redis.hGetAll(`refresh_token:${refresh_token}`);
+    if (!Object.keys(stored).length || stored.client_id !== auth.clientId) {
+      return tokenError(res, 400, 'invalid_grant', 'refresh_token invalido ou expirado');
+    }
+    await redis.del(`refresh_token:${refresh_token}`); // rotacao: invalida o antigo
+    return issueTokens(res, { clientId: auth.clientId, username: stored.username, scope: stored.scope, withRefresh: true });
+  }
+
+  if (grantType === 'client_credentials') {
+    const requested = (req.body.scope || client.scope).split(' ').filter(Boolean);
+    const allowed = client.scope.split(' ');
+    const scope = requested.filter((s) => allowed.includes(s)).join(' ');
+    // RFC 6749 §4.4.3 — refresh_token SHOULD NOT ser emitido neste grant.
+    return issueTokens(res, { clientId: auth.clientId, username: '', scope, withRefresh: false });
+  }
+
+  return tokenError(res, 400, 'unsupported_grant_type', `grant_type=${grantType} nao suportado`);
+});
+
+async function issueTokens(res, { clientId, username, scope, withRefresh }) {
+  const accessToken = genToken();
+  await redis.hSet(`access_token:${accessToken}`, { client_id: clientId, username, scope });
+  await redis.expire(`access_token:${accessToken}`, ACCESS_TOKEN_TTL);
+
+  const body = {
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: ACCESS_TOKEN_TTL,
+    scope,
+  };
+
+  if (withRefresh) {
+    const refreshToken = genToken();
+    await redis.hSet(`refresh_token:${refreshToken}`, { client_id: clientId, username, scope });
+    await redis.expire(`refresh_token:${refreshToken}`, REFRESH_TOKEN_TTL);
+    body.refresh_token = refreshToken;
+  }
+
+  res.set('Cache-Control', 'no-store');
+  res.set('Pragma', 'no-cache');
+  res.json(body);
+}
+
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+connectRedis()
+  .then(seed)
+  .then(() => {
+    app.listen(PORT, () => console.log(`[authorization-server] ouvindo em :${PORT}`));
+  })
+  .catch((err) => {
+    console.error('[authorization-server] falha ao iniciar:', err);
+    process.exit(1);
+  });
